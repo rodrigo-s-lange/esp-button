@@ -61,6 +61,7 @@ void app_main(void)
 
 - `esp_button_init(log_enabled, at_enabled)`
 - `esp_button_deinit()`
+- `esp_button_is_initialized()`
 - `esp_button_create()`
 - `esp_button_delete()`
 - `esp_button_register_gpio()`
@@ -76,16 +77,30 @@ void app_main(void)
 - `esp_button_trigger_event()`
 - `esp_button_find_by_id()`
 - `esp_button_find_by_pin()`
+- `esp_button_count_active()`
+- `esp_button_is_pressed()`
+- `esp_button_get_state()`
+- `esp_button_was_pressed()`
+- `esp_button_was_pressed_for()`
+- `esp_button_get_click_count()`
+- `esp_button_get_long_click_count()`
+- `esp_button_get_last_event()`
+- `esp_button_get_pin()`
+- `esp_button_get_id()`
+- `esp_button_event_to_string()`
 
 ## AT commands
 
 When `at_enabled=true`:
 - `AT+BTN=<pin>,<id>`
 - `AT+BTN?`
-- `AT+BTN=<id>,TAP`
+- `AT+BTN=<id>,<event>`
+
+See `COMMANDS.md` for syntax and examples.
 
 ## Notes
 
 - Public API is non-blocking.
 - Keep callbacks short.
 - For custom sources such as touch or I2C expanders, use `ESP_BUTTON_MODE_VIRTUAL`.
+- The component keeps fixed slots and does not allocate button objects dynamically.

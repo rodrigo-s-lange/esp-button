@@ -10,6 +10,7 @@
 
 #include "esp_at.h"
 #include "esp_button.h"
+#include "esp_gpio.h"
 
 struct esp_button {
     bool used;
@@ -48,9 +49,24 @@ static SemaphoreHandle_t s_mutex = NULL;
 static TaskHandle_t s_task = NULL;
 static bool s_initialized = false;
 static bool s_at_registered = false;
+static bool s_log_enabled = false;
+static bool s_at_enabled = false;
 static int s_next_id = 1;
 static esp_button_event_cb_t s_default_callback = NULL;
 static void *s_default_user_ctx = NULL;
+
+#define BUTTON_LOGI(...) do { if (s_log_enabled) ESP_LOGI(TAG, __VA_ARGS__); } while (0)
+#define BUTTON_LOGW(...) do { if (s_log_enabled) ESP_LOGW(TAG, __VA_ARGS__); } while (0)
+
+typedef struct {
+    esp_button_t *button;
+    esp_button_event_t event;
+    esp_button_event_cb_t callback;
+    void *user_ctx;
+} button_emit_ctx_t;
+
+static esp_button_t *_find_button_by_id_locked(int id);
+static esp_button_t *_find_button_by_pin_locked(uint8_t pin);
 
 static uint32_t _now_ms(void)
 {
@@ -89,15 +105,38 @@ static bool _eq_ci(const char *a, const char *b)
     return (*a == '\0' && *b == '\0');
 }
 
-static void _emit_event(esp_button_t *button, esp_button_event_t event)
+static void _emit_event(button_emit_ctx_t *emit)
 {
-    if (button == NULL || event == ESP_BUTTON_EVENT_NONE) return;
-    button->last_event = event;
-    if (button->callback != NULL) {
-        button->callback(button, event, button->user_ctx);
-    } else if (s_default_callback != NULL) {
-        s_default_callback(button, event, s_default_user_ctx);
+    if (emit == NULL || emit->button == NULL || emit->event == ESP_BUTTON_EVENT_NONE) return;
+    BUTTON_LOGI("callback id=%d pin=%u event=%s",
+                emit->button->id,
+                (unsigned)emit->button->pin,
+                esp_button_event_to_string(emit->event));
+    if (emit->callback != NULL) {
+        emit->callback(emit->button, emit->event, emit->user_ctx);
     }
+}
+
+static void _emit_event_locked(esp_button_t *button, esp_button_event_t event)
+{
+    button_emit_ctx_t emit = {0};
+
+    if (button == NULL || event == ESP_BUTTON_EVENT_NONE) return;
+
+    button->last_event = event;
+    emit.button = button;
+    emit.event = event;
+    if (button->callback != NULL) {
+        emit.callback = button->callback;
+        emit.user_ctx = button->user_ctx;
+    } else {
+        emit.callback = s_default_callback;
+        emit.user_ctx = s_default_user_ctx;
+    }
+
+    xSemaphoreGive(s_mutex);
+    _emit_event(&emit);
+    (void)xSemaphoreTake(s_mutex, portMAX_DELAY);
 }
 
 const char *esp_button_event_to_string(esp_button_event_t event)
@@ -121,6 +160,29 @@ static esp_err_t _validate_gpio_pin(uint8_t pin)
     if (pin >= GPIO_NUM_MAX) return ESP_ERR_INVALID_ARG;
     if (((SOC_GPIO_VALID_GPIO_MASK >> pin) & 0x1ULL) == 0ULL) return ESP_ERR_INVALID_ARG;
     return ESP_OK;
+}
+
+static esp_err_t _release_button_owner_by_pin(uint8_t pin)
+{
+    if (!s_initialized || s_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    esp_button_t *button = _find_button_by_pin_locked(pin);
+    if (button != NULL) {
+        memset(button, 0, sizeof(*button));
+    }
+    xSemaphoreGive(s_mutex);
+
+    return esp_gpio_release_owner(pin, ESP_GPIO_OWNER_BUTTON);
+}
+
+static void _release_button_pin(const esp_button_t *button)
+{
+    if (button == NULL || !button->used || button->mode != ESP_BUTTON_MODE_GPIO) return;
+    esp_err_t err = esp_gpio_release_owner(button->pin, ESP_GPIO_OWNER_BUTTON);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        BUTTON_LOGW("gpio %u release falhou: %s", (unsigned)button->pin, esp_err_to_name(err));
+    }
 }
 
 static esp_err_t _configure_gpio_input(const esp_button_config_t *config)
@@ -196,13 +258,13 @@ static void _finalize_click_sequence(esp_button_t *button)
 
     switch (button->click_count) {
         case 1:
-            _emit_event(button, ESP_BUTTON_EVENT_CLICK);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_CLICK);
             break;
         case 2:
-            _emit_event(button, ESP_BUTTON_EVENT_DOUBLE_CLICK);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_DOUBLE_CLICK);
             break;
         default:
-            _emit_event(button, ESP_BUTTON_EVENT_TRIPLE_CLICK);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_TRIPLE_CLICK);
             break;
     }
 
@@ -231,21 +293,21 @@ static void _process_button(esp_button_t *button, uint32_t now_ms)
     if (button->stable_pressed != button->raw_pressed) {
         button->stable_pressed = button->raw_pressed;
         button->pressed_latched = true;
-        _emit_event(button, ESP_BUTTON_EVENT_CHANGED);
+        _emit_event_locked(button, ESP_BUTTON_EVENT_CHANGED);
 
         if (button->stable_pressed) {
             button->press_start_ms = now_ms;
             button->long_detected = false;
             button->last_long_report_ms = now_ms;
-            _emit_event(button, ESP_BUTTON_EVENT_PRESSED);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_PRESSED);
         } else {
             button->last_press_duration_ms = now_ms - button->press_start_ms;
-            _emit_event(button, ESP_BUTTON_EVENT_RELEASED);
-            _emit_event(button, ESP_BUTTON_EVENT_TAP);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_RELEASED);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_TAP);
 
             if (button->long_detected || button->last_press_duration_ms >= button->long_click_ms) {
                 button->long_click_count++;
-                _emit_event(button, ESP_BUTTON_EVENT_LONG_CLICK);
+                _emit_event_locked(button, ESP_BUTTON_EVENT_LONG_CLICK);
                 button->click_count = 0U;
                 button->click_deadline_ms = 0U;
             } else {
@@ -263,12 +325,12 @@ static void _process_button(esp_button_t *button, uint32_t now_ms)
             button->long_detected = true;
             button->long_click_count = 1U;
             button->last_long_report_ms = now_ms;
-            _emit_event(button, ESP_BUTTON_EVENT_LONG_DETECTED);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_LONG_DETECTED);
         } else if (button->long_detected && button->long_detect_retrigger &&
                    (now_ms - button->last_long_report_ms) >= button->long_click_ms) {
             button->long_click_count++;
             button->last_long_report_ms = now_ms;
-            _emit_event(button, ESP_BUTTON_EVENT_LONG_DETECTED);
+            _emit_event_locked(button, ESP_BUTTON_EVENT_LONG_DETECTED);
         }
     } else if (button->click_deadline_ms != 0U && now_ms >= button->click_deadline_ms) {
         _finalize_click_sequence(button);
@@ -281,8 +343,7 @@ static void _button_task(void *arg)
 
     while (1) {
         if (!s_initialized) {
-            vTaskDelete(NULL);
-            return;
+            break;
         }
 
         if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
@@ -295,6 +356,11 @@ static void _button_task(void *arg)
 
         vTaskDelay(pdMS_TO_TICKS(ESP_BUTTON_DEFAULT_POLL_MS));
     }
+
+    if (s_task == xTaskGetCurrentTaskHandle()) {
+        s_task = NULL;
+    }
+    vTaskDelete(NULL);
 }
 
 static esp_err_t _parse_btn_event(const char *text, esp_button_event_t *out_event)
@@ -405,28 +471,54 @@ static esp_err_t _register_at_commands(void)
     return ESP_OK;
 }
 
-esp_err_t esp_button_init(void)
+esp_err_t esp_button_init(bool log_enabled, bool at_enabled)
 {
     if (s_initialized) return ESP_ERR_INVALID_STATE;
 
-    esp_err_t err = _register_at_commands();
-    if (err != ESP_OK) return err;
+    s_log_enabled = log_enabled;
+    s_at_enabled = at_enabled;
+
+    esp_err_t err = ESP_OK;
+    if (s_at_enabled) {
+        err = _register_at_commands();
+        if (err != ESP_OK) {
+            s_log_enabled = false;
+            s_at_enabled = false;
+            return err;
+        }
+    }
+
+    err = esp_gpio_set_owner_release_handler(ESP_GPIO_OWNER_BUTTON, _release_button_owner_by_pin);
+    if (err != ESP_OK) {
+        s_log_enabled = false;
+        s_at_enabled = false;
+        return err;
+    }
 
     s_mutex = xSemaphoreCreateMutex();
-    if (s_mutex == NULL) return ESP_ERR_NO_MEM;
+    if (s_mutex == NULL) {
+        s_log_enabled = false;
+        s_at_enabled = false;
+        return ESP_ERR_NO_MEM;
+    }
 
     memset(s_buttons, 0, sizeof(s_buttons));
     s_next_id = 1;
 
+    s_initialized = true;
+
     BaseType_t ok = xTaskCreate(_button_task, "esp_button", 3072, NULL, 8, &s_task);
     if (ok != pdPASS) {
+        s_initialized = false;
         vSemaphoreDelete(s_mutex);
         s_mutex = NULL;
+        (void)esp_gpio_set_owner_release_handler(ESP_GPIO_OWNER_BUTTON, NULL);
+        s_log_enabled = false;
+        s_at_enabled = false;
         return ESP_ERR_NO_MEM;
     }
 
-    s_initialized = true;
-    ESP_LOGI(TAG, "initialized");
+    BUTTON_LOGI("initialized (AT=%s)", s_at_enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -437,15 +529,32 @@ esp_err_t esp_button_deinit(void)
     s_initialized = false;
     if (s_task != NULL) {
         TaskHandle_t task = s_task;
-        s_task = NULL;
-        vTaskDelete(task);
+        for (int i = 0; i < 20 && s_task == task; i++) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (s_task == task) {
+            s_task = NULL;
+            vTaskDelete(task);
+        }
     }
     if (s_mutex != NULL) {
         vSemaphoreDelete(s_mutex);
         s_mutex = NULL;
     }
 
+    (void)esp_gpio_set_owner_release_handler(ESP_GPIO_OWNER_BUTTON, NULL);
+
+    for (size_t i = 0; i < ESP_BUTTON_MAX_BUTTONS; i++) {
+        _release_button_pin(&s_buttons[i]);
+    }
+
+    BUTTON_LOGI("deinitialized");
     memset(s_buttons, 0, sizeof(s_buttons));
+    s_default_callback = NULL;
+    s_default_user_ctx = NULL;
+    s_next_id = 1;
+    s_log_enabled = false;
+    s_at_enabled = false;
     return ESP_OK;
 }
 
@@ -461,13 +570,23 @@ esp_err_t esp_button_create(const esp_button_config_t *config, esp_button_t **ou
     if (err != ESP_OK) return err;
 
     if (config->mode == ESP_BUTTON_MODE_GPIO) {
-        err = _configure_gpio_input(config);
+        err = esp_gpio_claim_owner(config->pin, ESP_GPIO_OWNER_BUTTON);
         if (err != ESP_OK) return err;
+        err = _configure_gpio_input(config);
+        if (err != ESP_OK) {
+            (void)esp_gpio_release_owner(config->pin, ESP_GPIO_OWNER_BUTTON);
+            return err;
+        }
     } else if (config->read_cb == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        if (config->mode == ESP_BUTTON_MODE_GPIO) {
+            (void)esp_gpio_release_owner(config->pin, ESP_GPIO_OWNER_BUTTON);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
 
     for (size_t i = 0; i < ESP_BUTTON_MAX_BUTTONS; i++) {
         if (s_buttons[i].used) continue;
@@ -494,6 +613,7 @@ esp_err_t esp_button_create(const esp_button_config_t *config, esp_button_t **ou
         button->stable_pressed = button->raw_pressed;
 
         *out_button = button;
+        BUTTON_LOGI("created id=%d pin=%u mode=%d", button->id, (unsigned)button->pin, (int)button->mode);
         xSemaphoreGive(s_mutex);
         return ESP_OK;
     }
@@ -504,6 +624,10 @@ esp_err_t esp_button_create(const esp_button_config_t *config, esp_button_t **ou
 
 esp_err_t esp_button_register_gpio(uint8_t pin, int id, esp_button_t **out_button)
 {
+    esp_err_t err = _check_ready();
+    if (err != ESP_OK) return err;
+    if (out_button == NULL) return ESP_ERR_INVALID_ARG;
+
     esp_button_config_t cfg = {
         .pin = pin,
         .mode = ESP_BUTTON_MODE_GPIO,
@@ -511,18 +635,61 @@ esp_err_t esp_button_register_gpio(uint8_t pin, int id, esp_button_t **out_butto
         .active_low = true,
         .id = id,
     };
+    *out_button = NULL;
 
-    esp_button_t *existing = esp_button_find_by_id(id);
-    if (existing != NULL) {
-        esp_button_delete(existing);
+    err = esp_gpio_claim_owner(pin, ESP_GPIO_OWNER_BUTTON);
+    if (err != ESP_OK) return err;
+
+    err = _configure_gpio_input(&cfg);
+    if (err != ESP_OK) {
+        (void)esp_gpio_release_owner(pin, ESP_GPIO_OWNER_BUTTON);
+        return err;
     }
 
-    existing = esp_button_find_by_pin(pin);
-    if (existing != NULL) {
-        esp_button_delete(existing);
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        (void)esp_gpio_release_owner(pin, ESP_GPIO_OWNER_BUTTON);
+        return ESP_ERR_TIMEOUT;
     }
 
-    return esp_button_create(&cfg, out_button);
+    esp_button_t *existing = _find_button_by_id_locked(id);
+    if (existing != NULL) {
+        if (existing->pin != pin) {
+            _release_button_pin(existing);
+        }
+        memset(existing, 0, sizeof(*existing));
+    }
+
+    existing = _find_button_by_pin_locked(pin);
+    if (existing != NULL) {
+        memset(existing, 0, sizeof(*existing));
+    }
+
+    for (size_t i = 0; i < ESP_BUTTON_MAX_BUTTONS; i++) {
+        if (s_buttons[i].used) continue;
+
+        esp_button_t *button = &s_buttons[i];
+        memset(button, 0, sizeof(*button));
+        button->used = true;
+        button->pin = cfg.pin;
+        button->mode = cfg.mode;
+        button->input_mode = cfg.input_mode;
+        button->active_low = cfg.active_low;
+        button->debounce_ms = ESP_BUTTON_DEFAULT_DEBOUNCE_MS;
+        button->long_click_ms = ESP_BUTTON_DEFAULT_LONG_MS;
+        button->double_click_ms = ESP_BUTTON_DEFAULT_DOUBLE_MS;
+        button->id = cfg.id;
+        button->last_event = ESP_BUTTON_EVENT_NONE;
+        button->last_change_ms = _now_ms();
+        _read_pressed(button, &button->raw_pressed);
+        button->stable_pressed = button->raw_pressed;
+        *out_button = button;
+        BUTTON_LOGI("registered gpio id=%d pin=%u", button->id, (unsigned)button->pin);
+        xSemaphoreGive(s_mutex);
+        return ESP_OK;
+    }
+
+    xSemaphoreGive(s_mutex);
+    return ESP_ERR_NO_MEM;
 }
 
 esp_err_t esp_button_delete(esp_button_t *button)
@@ -532,6 +699,8 @@ esp_err_t esp_button_delete(esp_button_t *button)
     if (button == NULL) return ESP_ERR_INVALID_ARG;
 
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    BUTTON_LOGI("deleted id=%d pin=%u", button->id, (unsigned)button->pin);
+    _release_button_pin(button);
     memset(button, 0, sizeof(*button));
     xSemaphoreGive(s_mutex);
     return ESP_OK;
@@ -540,52 +709,74 @@ esp_err_t esp_button_delete(esp_button_t *button)
 esp_err_t esp_button_set_callback(esp_button_t *button, esp_button_event_cb_t callback, void *user_ctx)
 {
     if (button == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->callback = callback;
     button->user_ctx = user_ctx;
+    BUTTON_LOGI("set callback id=%d pin=%u", button->id, (unsigned)button->pin);
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_default_callback(esp_button_event_cb_t callback, void *user_ctx)
 {
+    if (!s_initialized || s_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     s_default_callback = callback;
     s_default_user_ctx = user_ctx;
+    BUTTON_LOGI("set default callback");
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_debounce_time(esp_button_t *button, uint16_t ms)
 {
     if (button == NULL || ms == 0U) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->debounce_ms = ms;
+    BUTTON_LOGI("set debounce id=%d pin=%u ms=%u", button->id, (unsigned)button->pin, (unsigned)ms);
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_long_click_time(esp_button_t *button, uint16_t ms)
 {
     if (button == NULL || ms == 0U) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->long_click_ms = ms;
+    BUTTON_LOGI("set long_click id=%d pin=%u ms=%u", button->id, (unsigned)button->pin, (unsigned)ms);
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_double_click_time(esp_button_t *button, uint16_t ms)
 {
     if (button == NULL || ms == 0U) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->double_click_ms = ms;
+    BUTTON_LOGI("set double_click id=%d pin=%u ms=%u", button->id, (unsigned)button->pin, (unsigned)ms);
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_read_callback(esp_button_t *button, esp_button_read_cb_t read_cb, void *read_ctx)
 {
     if (button == NULL || read_cb == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->mode = ESP_BUTTON_MODE_VIRTUAL;
     button->read_cb = read_cb;
     button->read_ctx = read_ctx;
+    BUTTON_LOGI("set read callback id=%d pin=%u", button->id, (unsigned)button->pin);
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
 esp_err_t esp_button_set_long_detect_retrigger(esp_button_t *button, bool enable)
 {
     if (button == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     button->long_detect_retrigger = enable;
+    BUTTON_LOGI("set long retrigger id=%d pin=%u enable=%s", button->id, (unsigned)button->pin, enable ? "true" : "false");
+    xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
 
@@ -635,7 +826,11 @@ esp_err_t esp_button_trigger_event(esp_button_t *button, esp_button_event_t even
         default:
             break;
     }
-    _emit_event(button, event);
+    BUTTON_LOGI("trigger event id=%d pin=%u event=%s",
+                button->id,
+                (unsigned)button->pin,
+                esp_button_event_to_string(event));
+    _emit_event_locked(button, event);
     xSemaphoreGive(s_mutex);
     return ESP_OK;
 }
