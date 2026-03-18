@@ -471,6 +471,15 @@ static esp_err_t _register_at_commands(void)
     return ESP_OK;
 }
 
+static void _unregister_at_commands(void)
+{
+    if (!s_at_registered) return;
+
+    (void)esp_at_unregister_cmd("AT+BTN");
+    (void)esp_at_unregister_cmd("AT+BTN?");
+    s_at_registered = false;
+}
+
 esp_err_t esp_button_init(bool log_enabled, bool at_enabled)
 {
     if (s_initialized) return ESP_ERR_INVALID_STATE;
@@ -549,6 +558,7 @@ esp_err_t esp_button_deinit(void)
     }
 
     BUTTON_LOGI("deinitialized");
+    _unregister_at_commands();
     memset(s_buttons, 0, sizeof(s_buttons));
     s_default_callback = NULL;
     s_default_user_ctx = NULL;
