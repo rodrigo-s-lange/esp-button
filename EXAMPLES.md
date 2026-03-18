@@ -21,7 +21,7 @@ static void on_button(esp_button_t *button, esp_button_event_t event, void *ctx)
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(esp_button_init());
+    ESP_ERROR_CHECK(esp_button_init(true, false));
     ESP_ERROR_CHECK(esp_button_set_default_callback(on_button, NULL));
 
     esp_button_t *button = NULL;
@@ -43,7 +43,7 @@ static esp_err_t read_virtual_button(void *ctx, bool *out_pressed)
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(esp_button_init());
+    ESP_ERROR_CHECK(esp_button_init(false, false));
 
     esp_button_config_t cfg = {
         .mode = ESP_BUTTON_MODE_VIRTUAL,
@@ -56,6 +56,10 @@ void app_main(void)
 ```
 
 ## AT-driven setup
+
+```c
+ESP_ERROR_CHECK(esp_button_init(false, true));
+```
 
 ```text
 AT+BTN=23,1
