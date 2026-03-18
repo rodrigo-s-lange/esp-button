@@ -466,6 +466,8 @@ static esp_err_t _register_at_commands(void)
 
     err = esp_at_register_cmd_example("AT+BTN?", _at_btn_query, "AT+BTN?");
     if (err != ESP_OK) return err;
+    err = esp_at_set_help_visible("AT+BTN", false);
+    if (err != ESP_OK) return err;
 
     s_at_registered = true;
     return ESP_OK;
